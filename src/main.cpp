@@ -9,6 +9,7 @@ LiquidCrystal_I2C *lcd = nullptr;
 
 #define BUZZER_PIN D3
 #define JOYSTICK_X_PIN A0
+#define PAUSE_BUTTON_PIN D2
 #define REST 0
 #define NUM_BANDS 16
 #define BAR_MIN_HEIGHT 25
@@ -25,6 +26,13 @@ const unsigned long SKIP_INTERVAL = 1500; // 1.5 seconds in milliseconds
 bool joystickHeld = false;
 int lastJoystickDirection = 0; // 0 = neutral, 1 = right, -1 = left
 int skipDirection = 0; // 0 = no skip, 1 = next, -1 = previous
+
+// Pause state tracking
+bool isPaused = false;
+int lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long DEBOUNCE_DELAY = 50; // 50ms debounce delay
+const unsigned long BUTTON_PRESS_COOLDOWN = 200; // 200ms between button presses
 
 // Scan I2C bus for LCD address (address-independent)
 uint8_t scanI2CForLCD() {
@@ -198,6 +206,38 @@ int checkJoystick() {
   return 0; // No skip
 }
 
+bool checkPauseButton() {
+  static unsigned long lastPressTime = 0;
+  static int lastStableReading = HIGH;
+  int reading = digitalRead(PAUSE_BUTTON_PIN);
+  unsigned long currentTime = millis();
+  
+  // Simple debounce: if button state changed, reset debounce timer
+  if (reading != lastButtonState) {
+    lastDebounceTime = currentTime;
+  }
+  
+  lastButtonState = reading;
+  
+  // Only process if debounce time has passed
+  if ((currentTime - lastDebounceTime) > DEBOUNCE_DELAY) {
+    // Detect button press (HIGH to LOW transition) with cooldown
+    if (reading == LOW && lastStableReading == HIGH && 
+        (currentTime - lastPressTime) > BUTTON_PRESS_COOLDOWN) {
+      lastStableReading = LOW;
+      lastPressTime = currentTime;
+      return true; // Button was just pressed
+    }
+    
+    // Update stable reading on release
+    if (reading == HIGH) {
+      lastStableReading = HIGH;
+    }
+  }
+  
+  return false;
+}
+
 void playSong(int songIndex) {
   if (songIndex >= song_count)
     return;
@@ -214,13 +254,41 @@ void playSong(int songIndex) {
     skipDirection = checkJoystick();
     if (skipDirection != 0) {
       noTone(BUZZER_PIN);
+      isPaused = false; // Reset pause state when skipping
       return; // Exit function to skip song
+    }
+
+    // Check pause button before playing note
+    if (checkPauseButton()) {
+      isPaused = !isPaused; // Toggle pause state
     }
 
     int divider = song.melody[i + 1];
     int duration =
         (divider > 0) ? wholenote / divider : (wholenote / abs(divider)) * 1.5;
     int currentNote = song.melody[i];
+
+    // If paused, wait in a loop until unpaused
+    while (isPaused) {
+      noTone(BUZZER_PIN); // Make sure tone is off
+      
+      // Check for unpause
+      if (checkPauseButton()) {
+        isPaused = false;
+        break;
+      }
+      
+      // Check for skip while paused
+      skipDirection = checkJoystick();
+      if (skipDirection != 0) {
+        isPaused = false;
+        return; // Exit function to skip song
+      }
+      
+      // Update visualizer with rest (no note) while paused
+      updateVisualizer(REST);
+      delay(20); // Small delay to prevent tight loop
+    }
 
     // Play note
     if (currentNote != 0) {
@@ -234,7 +302,35 @@ void playSong(int songIndex) {
       skipDirection = checkJoystick();
       if (skipDirection != 0) {
         noTone(BUZZER_PIN);
+        isPaused = false; // Reset pause state when skipping
         return; // Exit function to skip song
+      }
+      
+      // Check pause button during note playback
+      if (checkPauseButton()) {
+        isPaused = !isPaused;
+        noTone(BUZZER_PIN);
+        // If paused, wait until unpaused
+        while (isPaused) {
+          // Check for unpause
+          if (checkPauseButton()) {
+            isPaused = false;
+            break;
+          }
+          
+          // Check for skip while paused
+          skipDirection = checkJoystick();
+          if (skipDirection != 0) {
+            isPaused = false;
+            return; // Exit function to skip song
+          }
+          
+          // Update visualizer with rest (no note) while paused
+          updateVisualizer(REST);
+          delay(20);
+        }
+        // When unpaused, break out of note loop to move to next note
+        break;
       }
       
       updateVisualizer(currentNote);
@@ -244,8 +340,9 @@ void playSong(int songIndex) {
     noTone(BUZZER_PIN);
   }
   
-  // Song completed normally, reset skip direction
+  // Song completed normally, reset skip direction and pause state
   skipDirection = 0;
+  isPaused = false;
 }
 
 void setup() {
@@ -267,6 +364,10 @@ void setup() {
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(JOYSTICK_X_PIN, INPUT);
+  pinMode(PAUSE_BUTTON_PIN, INPUT_PULLUP);
+  
+  // Initialize button state
+  lastButtonState = digitalRead(PAUSE_BUTTON_PIN);
 
   // Display startup message on OLED
   u8g2.clearBuffer();
@@ -282,6 +383,11 @@ void setup() {
 }
 
 void loop() {
+  // Check pause button before playing song (in case we need to pause immediately)
+  if (checkPauseButton()) {
+    isPaused = !isPaused;
+  }
+  
   playSong(currentSong);
 
   // Handle navigation based on skip direction or normal progression
