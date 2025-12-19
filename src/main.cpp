@@ -11,6 +11,7 @@ LiquidCrystal_I2C *lcd = nullptr;
 #define BUTTON_PIN D2
 #define REST 0
 #define NUM_BANDS 16
+#define BAR_MIN_HEIGHT 25
 
 const Song *const *songs = all_songs;
 extern const unsigned int song_count;
@@ -76,20 +77,40 @@ int noteToBar(int note) {
 }
 
 void updateVisualizer(int currentNote) {
-  // Faster decay - increase this number for even faster
+  // Fast decay for ALL bars (including neighbors)
   for (int i = 0; i < NUM_BANDS; i++) {
-    if (visualBands[i] > 50) { // Decay to baseline of 50 instead of 0
-      visualBands[i] -= 60;    // Faster decay (was 15)
+    if (visualBands[i] > BAR_MIN_HEIGHT) {
+      visualBands[i] -= 50; // Fast decay applies to everyone
+      if (visualBands[i] < BAR_MIN_HEIGHT) {
+        visualBands[i] = BAR_MIN_HEIGHT;
+      }
     } else {
-      visualBands[i] = 50; // Baseline level for all bars
+      visualBands[i] = BAR_MIN_HEIGHT;
     }
   }
 
-  // Set current note bar to max
+  // THEN add energy for current note and neighbors
   if (currentNote != REST) {
     int barIndex = noteToBar(currentNote);
     if (barIndex >= 0 && barIndex < NUM_BANDS) {
+      // Main bar gets max energy
       visualBands[barIndex] = 255;
+
+      // Immediate neighbors get a boost (not set to fixed value)
+      if (barIndex > 0) {
+        visualBands[barIndex - 1] = min(200, visualBands[barIndex - 1] + 100);
+      }
+      if (barIndex < NUM_BANDS - 1) {
+        visualBands[barIndex + 1] = min(200, visualBands[barIndex + 1] + 100);
+      }
+
+      // Second neighbors get smaller boost
+      if (barIndex > 1) {
+        visualBands[barIndex - 2] = min(175, visualBands[barIndex - 2] + 50);
+      }
+      if (barIndex < NUM_BANDS - 2) {
+        visualBands[barIndex + 2] = min(175, visualBands[barIndex + 2] + 50);
+      }
     }
   }
 
