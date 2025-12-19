@@ -8,7 +8,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 LiquidCrystal_I2C *lcd = nullptr;
 
 #define BUZZER_PIN D3
-#define BUTTON_PIN D2
+#define JOYSTICK_X_PIN A0
 #define REST 0
 #define NUM_BANDS 16
 #define BAR_MIN_HEIGHT 25
@@ -19,9 +19,12 @@ extern const unsigned int song_count;
 int currentSong = 0;
 uint8_t visualBands[NUM_BANDS] = {0};
 
-volatile bool buttonPressed = false;
-
-void buttonISR() { buttonPressed = true; }
+// Joystick state tracking
+unsigned long lastSkipTime = 0;
+const unsigned long SKIP_INTERVAL = 1500; // 1.5 seconds in milliseconds
+bool joystickHeld = false;
+int lastJoystickDirection = 0; // 0 = neutral, 1 = right, -1 = left
+int skipDirection = 0; // 0 = no skip, 1 = next, -1 = previous
 
 // Scan I2C bus for LCD address (address-independent)
 uint8_t scanI2CForLCD() {
@@ -132,7 +135,20 @@ void updateSongDisplay(int songIndex) {
   if (lcd && songIndex < song_count) {
     const Song &song = *all_songs[songIndex];
     lcd->setCursor(0, 0);
-    lcd->print("Current Song:    ");
+    // Print "Current Song (X/41)" - need to fit in 16 chars
+    // "Current Song (X/41)" is too long, so use "Cur Song (X/41)" or similar
+    String songCounter = "(" + String(songIndex + 1) + "/" + String(song_count) + ")";
+    String displayText = "Song " + songCounter + ":";
+    // Pad with spaces to clear any remaining characters
+    while (displayText.length() < 16) {
+      displayText += " ";
+    }
+    // Truncate if needed to fit 16 characters
+    if (displayText.length() > 16) {
+      displayText = displayText.substring(0, 16);
+    }
+    lcd->print(displayText);
+    
     lcd->setCursor(0, 1);
     // Clear the line and print song name (max 16 chars)
     lcd->print("                "); // Clear line
@@ -148,6 +164,40 @@ void updateSongDisplay(int songIndex) {
   }
 }
 
+int checkJoystick() {
+  int joystickX = analogRead(JOYSTICK_X_PIN);
+  int currentDirection = 0;
+  
+  if (joystickX > 990) {
+    currentDirection = 1; // Right
+  } else if (joystickX < 20) {
+    currentDirection = -1; // Left
+  } else {
+    currentDirection = 0; // Neutral
+  }
+  
+  if (currentDirection != 0) {
+    unsigned long currentTime = millis();
+    
+    // If direction changed or first press, skip immediately
+    if (currentDirection != lastJoystickDirection || !joystickHeld) {
+      lastSkipTime = currentTime;
+      joystickHeld = true;
+      return currentDirection; // Return direction for immediate skip
+    } else if (joystickHeld && (currentTime - lastSkipTime >= SKIP_INTERVAL)) {
+      // Timer-based skipping while held
+      lastSkipTime = currentTime;
+      return currentDirection; // Return direction for timer-based skip
+    }
+  } else {
+    // Joystick released
+    joystickHeld = false;
+  }
+  
+  lastJoystickDirection = currentDirection;
+  return 0; // No skip
+}
+
 void playSong(int songIndex) {
   if (songIndex >= song_count)
     return;
@@ -160,9 +210,11 @@ void playSong(int songIndex) {
   int wholenote = (60000 * 4) / song.tempo;
 
   for (unsigned int i = 0; i < song.length * 2; i += 2) {
-    if (buttonPressed) {
-      buttonPressed = false;
-      break;
+    // Check joystick input before playing note
+    skipDirection = checkJoystick();
+    if (skipDirection != 0) {
+      noTone(BUZZER_PIN);
+      return; // Exit function to skip song
     }
 
     int divider = song.melody[i + 1];
@@ -178,12 +230,22 @@ void playSong(int songIndex) {
     // Update visualizer during note
     unsigned long noteStart = millis();
     while (millis() - noteStart < duration) {
+      // Check joystick during note playback
+      skipDirection = checkJoystick();
+      if (skipDirection != 0) {
+        noTone(BUZZER_PIN);
+        return; // Exit function to skip song
+      }
+      
       updateVisualizer(currentNote);
       delay(20); // Refresh rate
     }
 
     noTone(BUZZER_PIN);
   }
+  
+  // Song completed normally, reset skip direction
+  skipDirection = 0;
 }
 
 void setup() {
@@ -198,15 +260,13 @@ void setup() {
     lcd = new LiquidCrystal_I2C(lcdAddress, 16, 2);
     lcd->init();
     lcd->backlight();
-    lcd->setCursor(0, 0);
-    lcd->print("Current Song:    ");
+    // Display will be updated by updateSongDisplay
     lcd->setCursor(0, 1);
     lcd->print("Initializing...  ");
   }
 
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
+  pinMode(JOYSTICK_X_PIN, INPUT);
 
   // Display startup message on OLED
   u8g2.clearBuffer();
@@ -224,10 +284,35 @@ void setup() {
 void loop() {
   playSong(currentSong);
 
-  currentSong++;
-  if (currentSong >= song_count) {
-    currentSong = 0;
+  // Handle navigation based on skip direction or normal progression
+  if (skipDirection == 1) {
+    // Skip to next song
+    currentSong++;
+    if (currentSong >= song_count) {
+      currentSong = 0;
+    }
+    // Reset joystick state
+    lastJoystickDirection = 0;
+    joystickHeld = false;
+    skipDirection = 0;
+    delay(200); // Debounce delay
+  } else if (skipDirection == -1) {
+    // Go to previous song
+    currentSong--;
+    if (currentSong < 0) {
+      currentSong = song_count - 1;
+    }
+    // Reset joystick state
+    lastJoystickDirection = 0;
+    joystickHeld = false;
+    skipDirection = 0;
+    delay(200); // Debounce delay
+  } else {
+    // No joystick input, advance normally
+    currentSong++;
+    if (currentSong >= song_count) {
+      currentSong = 0;
+    }
+    delay(1000);
   }
-
-  delay(1000);
 }
