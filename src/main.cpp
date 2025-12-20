@@ -253,14 +253,14 @@ void drawUI() {
 }
 
 int checkJoystickX() {
-  int joystickX = analogRead(JOYSTICK_X_PIN);
+  int joystickX = analogRead(JOYSTICK_Y_PIN);
   // Neutral by default
   int currentJoystickXDirection = 0;
   int flick = 0;
   
-  if (joystickX > 990) {
+  if (joystickX > 950) {
     currentJoystickXDirection = 1; // Right
-  } else if (joystickX < 20) {
+  } else if (joystickX < 250) {
     currentJoystickXDirection = -1; // Left
   }
 
@@ -277,15 +277,15 @@ int checkJoystickX() {
 }
 
 int checkJoystickY() {
-  int joystickY = analogRead(JOYSTICK_Y_PIN);
+  int joystickY = analogRead(JOYSTICK_X_PIN);
   // Neutral by default
   int currentJoystickYDirection = 0;
   int flick = 0;
   
-  if (joystickY > 990) {
-    currentJoystickYDirection = -1; // Down
-  } else if (joystickY < 20) {
+  if (joystickY > 950) {
     currentJoystickYDirection = 1; // Up
+  } else if (joystickY < 250) {
+    currentJoystickYDirection = -1; // Down
   }
 
   unsigned long currentTime = millis();
