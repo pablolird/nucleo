@@ -1,38 +1,58 @@
+#include "clib/u8g2.h"
 #include "song_list.h"
 #include <Arduino.h>
 #include <LiquidCrystal_I2C.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include "note.h"
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 LiquidCrystal_I2C *lcd = nullptr;
 
 #define BUZZER_PIN D3
 #define JOYSTICK_X_PIN A0
+#define JOYSTICK_Y_PIN A1
 #define PAUSE_BUTTON_PIN D2
 #define REST 0
 #define NUM_BANDS 16
-#define BAR_MIN_HEIGHT 25
+#define BAR_PIXEL_TOP_Y 2
+#define BAR_PIXEL_BOT_Y 34
 
 const Song *const *songs = all_songs;
 extern const unsigned int song_count;
 
-int currentSong = 0;
-uint8_t visualBands[NUM_BANDS] = {0};
+// UI
+struct {
+  bool isPaused = false;
+  int currentSong = 0;
+  int currentSpeedSettingIdx = 2;
+
+  uint8_t visualBands[NUM_BANDS] = {0};
+
+  int currentSongNoteIdx = 0;
+  float *songNoteTimes;
+  float songDuration;
+
+  uint32_t scrollTimeBegin = 0;
+} uiState;
 
 // Joystick state tracking
-unsigned long lastSkipTime = 0;
 const unsigned long SKIP_INTERVAL = 1500; // 1.5 seconds in milliseconds
-bool joystickHeld = false;
-int lastJoystickDirection = 0; // 0 = neutral, 1 = right, -1 = left
-int skipDirection = 0; // 0 = no skip, 1 = next, -1 = previous
+unsigned long lastJoystickXFlick = 0;
+int lastJoystickXDirection = 0; // 0 = neutral, 1 = right, -1 = left
+unsigned long lastJoystickYFlick = 0;
+int lastJoystickYDirection = 0; // 0 = neutral, 1 = up, -1 = down
 
-// Pause state tracking
-bool isPaused = false;
+// Button state tracking
 int lastButtonState = HIGH;
 unsigned long lastDebounceTime = 0;
 const unsigned long DEBOUNCE_DELAY = 50; // 50ms debounce delay
 const unsigned long BUTTON_PRESS_COOLDOWN = 200; // 200ms between button presses
+
+// Playback parameters (speedup, volume, pitch)
+const float SPEED_SETTINGS[] = {0.25, 0.5, 1.0, 1.5, 2.0, 3.0};
+const char* SPEED_SETTINGS_STR[] = {"0.25x", "0.5x", "1.0x", "1.5x", "2.0x", "3.0x"};
+const int SPEED_SETTINGS_MAX_IDX = (sizeof(SPEED_SETTINGS) / sizeof(SPEED_SETTINGS[0]) - 1);
 
 // Scan I2C bus for LCD address (address-independent)
 uint8_t scanI2CForLCD() {
@@ -48,6 +68,30 @@ uint8_t scanI2CForLCD() {
     }
   }
   return 0; // Not found
+}
+
+void toneWithVolume(uint8_t pin, unsigned int frequency, unsigned long duration, uint8_t dutyCycle = 50) {
+  tone(pin, frequency, duration);
+  return;
+  // Constrain parameters
+  if (frequency < 31) frequency = 31;
+  dutyCycle = constrain(dutyCycle, 0, 100);
+  
+  // Calculate period in microseconds
+  unsigned long period = 1000000UL / frequency;
+  unsigned long highTime = (period * dutyCycle) / 100;
+  unsigned long lowTime = period - highTime; 
+  
+  pinMode(pin, OUTPUT);
+  
+  // Generate tone for specified duration
+  unsigned long endTime = millis() + duration;
+  while (millis() < endTime) {
+    digitalWrite(pin, HIGH);
+    delayMicroseconds(highTime);
+    digitalWrite(pin, LOW);
+    delayMicroseconds(lowTime);
+  }
 }
 
 // Map note to bar based on musical scale position
@@ -88,16 +132,11 @@ int noteToBar(int note) {
 }
 
 void updateVisualizer(int currentNote) {
+  auto& visualBands = uiState.visualBands;
+
   // Fast decay for ALL bars (including neighbors)
   for (int i = 0; i < NUM_BANDS; i++) {
-    if (visualBands[i] > BAR_MIN_HEIGHT) {
-      visualBands[i] -= 50; // Fast decay applies to everyone
-      if (visualBands[i] < BAR_MIN_HEIGHT) {
-        visualBands[i] = BAR_MIN_HEIGHT;
-      }
-    } else {
-      visualBands[i] = BAR_MIN_HEIGHT;
-    }
+    visualBands[i] = constrain(visualBands[i] - 50, 25, 255);
   }
 
   // THEN add energy for current note and neighbors
@@ -124,86 +163,141 @@ void updateVisualizer(int currentNote) {
       }
     }
   }
+}
 
-  // Draw bars
+void drawUI_oled() {
+  const Song &song = *all_songs[uiState.currentSong];
   u8g2.clearBuffer();
-  int barWidth = 128 / NUM_BANDS;
 
+  // Draw play status
+  int baseY = 40;
+  if (uiState.isPaused) {
+    u8g2.drawBox(0, baseY, 4, 12);
+    u8g2.drawBox(6, baseY, 4, 12);
+  } else {
+    u8g2.drawTriangle(0, baseY, 12, baseY + 6, 0, baseY + 12);
+  }
+
+  // Show speed
+  int curMinutes = ((unsigned long)uiState.songNoteTimes[uiState.currentSongNoteIdx] / 1000) / 60;
+  int curSeconds = ((unsigned long)uiState.songNoteTimes[uiState.currentSongNoteIdx] / 1000) % 60;
+  int durationMinutes = ((unsigned long)uiState.songDuration / 1000) / 60;
+  int durationSeconds = ((unsigned long)uiState.songDuration / 1000) % 60;
+  auto speedStr = SPEED_SETTINGS_STR[uiState.currentSpeedSettingIdx];
+  
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.setCursor(16, 50);
+  u8g2.printf("%02d:%02d/%02d:%02d (%s)", curMinutes, curSeconds, durationMinutes, durationSeconds, speedStr);
+  
+  // Song progress
+  int progressX = (int)((uiState.songNoteTimes[uiState.currentSongNoteIdx] / uiState.songDuration) * 128);
+  u8g2.drawBox(0, 59, progressX, 3);
+  u8g2.drawBox(progressX, 60, 128, 1);
+  u8g2.drawBox(progressX-1, 56, 2, 8);
+
+  // Draw visualizer
+  int barWidth = 128 / NUM_BANDS;
   for (int i = 0; i < NUM_BANDS; i++) {
-    int barHeight = map(visualBands[i], 0, 255, 0, 64);
+    int barHeight = map(uiState.visualBands[i], 0, 255, 0,
+    				  BAR_PIXEL_BOT_Y - BAR_PIXEL_TOP_Y);
     int x = i * barWidth;
-    int y = 64 - barHeight;
+    int y = BAR_PIXEL_BOT_Y - barHeight;
     u8g2.drawBox(x, y, barWidth - 1, barHeight);
   }
 
   u8g2.sendBuffer();
 }
 
-void updateSongDisplay(int songIndex) {
-  if (lcd && songIndex < song_count) {
-    const Song &song = *all_songs[songIndex];
+void drawUI_lcd() {
+  if (lcd) {
+    const Song &song = *all_songs[uiState.currentSong];
+    lcd->clear();
     lcd->setCursor(0, 0);
-    // Print "Current Song (X/41)" - need to fit in 16 chars
-    // "Current Song (X/41)" is too long, so use "Cur Song (X/41)" or similar
-    String songCounter = "(" + String(songIndex + 1) + "/" + String(song_count) + ")";
-    String displayText = "Song " + songCounter + ":";
-    // Pad with spaces to clear any remaining characters
-    while (displayText.length() < 16) {
-      displayText += " ";
-    }
-    // Truncate if needed to fit 16 characters
-    if (displayText.length() > 16) {
-      displayText = displayText.substring(0, 16);
-    }
-    lcd->print(displayText);
-    
+    lcd->printf("Song (%d/%d):", uiState.currentSong+1, song_count);
+
+    int songNameLength = strlen(song.name);
+
     lcd->setCursor(0, 1);
-    // Clear the line and print song name (max 16 chars)
-    lcd->print("                "); // Clear line
-    lcd->setCursor(0, 1);
-    if (song.name) {
-      // Truncate to 16 characters if needed
-      String songName = String(song.name);
-      if (songName.length() > 16) {
-        songName = songName.substring(0, 16);
+    if (songNameLength <= 16) {
+      lcd->printf("%s", song.name);
+    } else {
+      uint32_t scrollTime = millis() - uiState.scrollTimeBegin;
+      char songNameBuffer[17] = {};
+      int offset = 0;
+
+      const uint32_t T1 = 2000;
+      const uint32_t T2 = 8000;
+
+      if (scrollTime < 2000) {
+        offset = 0;
+      } else if (scrollTime >= T1 && scrollTime < T2) {
+        offset = ((scrollTime - T1) * (songNameLength + 1)) / (T2 - T1);
+      } else if (scrollTime >= T2) {
+        uiState.scrollTimeBegin = millis();
       }
-      lcd->print(songName);
+
+      for (int i = 0; i < 16; i++) {
+        songNameBuffer[i] = song.name[(offset + i) % (songNameLength + 1)];
+        if (songNameBuffer[i] == '\0')
+          songNameBuffer[i] = ' ';
+      }
+
+      lcd->printf("%s", songNameBuffer);
     }
   }
 }
 
-int checkJoystick() {
+void drawUI() {
+  drawUI_lcd();
+  drawUI_oled();
+}
+
+int checkJoystickX() {
   int joystickX = analogRead(JOYSTICK_X_PIN);
-  int currentDirection = 0;
+  // Neutral by default
+  int currentJoystickXDirection = 0;
+  int flick = 0;
   
   if (joystickX > 990) {
-    currentDirection = 1; // Right
+    currentJoystickXDirection = 1; // Right
   } else if (joystickX < 20) {
-    currentDirection = -1; // Left
-  } else {
-    currentDirection = 0; // Neutral
+    currentJoystickXDirection = -1; // Left
   }
-  
-  if (currentDirection != 0) {
-    unsigned long currentTime = millis();
-    
-    // If direction changed or first press, skip immediately
-    if (currentDirection != lastJoystickDirection || !joystickHeld) {
-      lastSkipTime = currentTime;
-      joystickHeld = true;
-      return currentDirection; // Return direction for immediate skip
-    } else if (joystickHeld && (currentTime - lastSkipTime >= SKIP_INTERVAL)) {
-      // Timer-based skipping while held
-      lastSkipTime = currentTime;
-      return currentDirection; // Return direction for timer-based skip
-    }
-  } else {
-    // Joystick released
-    joystickHeld = false;
+
+  unsigned long currentTime = millis();
+
+  // Only skip if direction changed OR the last skip was 1.5secs ago (timer-based skipping if held)
+  if ((currentJoystickXDirection != lastJoystickXDirection) ||
+	  (currentTime - lastJoystickXFlick >= SKIP_INTERVAL)) {
+	  lastJoystickXFlick = currentTime;
+	  flick = currentJoystickXDirection;
   }
+  lastJoystickXDirection = currentJoystickXDirection;
+  return flick;
+}
+
+int checkJoystickY() {
+  int joystickY = analogRead(JOYSTICK_Y_PIN);
+  // Neutral by default
+  int currentJoystickYDirection = 0;
+  int flick = 0;
   
-  lastJoystickDirection = currentDirection;
-  return 0; // No skip
+  if (joystickY > 990) {
+    currentJoystickYDirection = -1; // Down
+  } else if (joystickY < 20) {
+    currentJoystickYDirection = 1; // Up
+  }
+
+  unsigned long currentTime = millis();
+
+  // Only skip if direction changed OR the last skip was 1.5secs ago (timer-based skipping if held)
+  if ((currentJoystickYDirection != lastJoystickYDirection) ||
+	  (currentTime - lastJoystickYFlick >= SKIP_INTERVAL)) {
+	  lastJoystickYFlick = currentTime;
+	  flick = currentJoystickYDirection;
+  }
+  lastJoystickYDirection = currentJoystickYDirection;
+  return flick;
 }
 
 bool checkPauseButton() {
@@ -238,118 +332,88 @@ bool checkPauseButton() {
   return false;
 }
 
-void playSong(int songIndex) {
-  if (songIndex >= song_count)
-    return;
+int handlePauseOrSkipReq() {
+    int skip = 0;
+    bool isPaused = false;
+
+    if ((skip = checkJoystickX()) != 0)
+      return skip;
+    if (checkPauseButton())
+      isPaused = true;
+
+    while (isPaused) {
+      if ((skip = checkJoystickX()) != 0)
+        return skip;
+      // press again to unpause
+      if (checkPauseButton())
+        isPaused = false;
+
+      // Update visualizer with rest (no note) while paused
+      updateVisualizer(REST);
+      uiState.isPaused = true;
+      drawUI();
+      delay(20); // Small delay to prevent tight loop
+    }
+    
+    uiState.isPaused = false;
+    return 0;
+}
+
+// Returns how many songs to skip
+int playSong(int songIndex) {
+  int skip = 0;
+  int speedSettingIdx = 2;
+  int speedChange = 0;
 
   const Song &song = *all_songs[songIndex];
 
-  // Update LCD with current song name
-  updateSongDisplay(songIndex);
+  uiState.currentSong = songIndex;
+  songCumSum(song, uiState.songNoteTimes);
+  uiState.songDuration = uiState.songNoteTimes[song.length - 1];
+  uiState.scrollTimeBegin = millis();
+  uiState.currentSpeedSettingIdx = speedSettingIdx;
+  uiState.isPaused = false;
+  drawUI();
 
-  int wholenote = (60000 * 4) / song.tempo;
+  for (unsigned int noteIdx = 0; noteIdx < song.length; noteIdx++) {
+    uiState.currentSongNoteIdx = noteIdx;
 
-  for (unsigned int i = 0; i < song.length * 2; i += 2) {
-    // Check joystick input before playing note
-    skipDirection = checkJoystick();
-    if (skipDirection != 0) {
-      noTone(BUZZER_PIN);
-      isPaused = false; // Reset pause state when skipping
-      return; // Exit function to skip song
+    if ((skip = handlePauseOrSkipReq()) != 0)
+      return skip;
+
+    Note note = songGetNote(song, noteIdx);
+    note.durationMs /= SPEED_SETTINGS[speedSettingIdx];
+    if (note.frequency != 0) {
+      tone(BUZZER_PIN, note.frequency, (unsigned long)note.durationMs);
     }
 
-    // Check pause button before playing note
-    if (checkPauseButton()) {
-      isPaused = !isPaused; // Toggle pause state
-    }
-
-    int divider = song.melody[i + 1];
-    int duration =
-        (divider > 0) ? wholenote / divider : (wholenote / abs(divider)) * 1.5;
-    int currentNote = song.melody[i];
-
-    // If paused, wait in a loop until unpaused
-    while (isPaused) {
-      noTone(BUZZER_PIN); // Make sure tone is off
-      
-      // Check for unpause
-      if (checkPauseButton()) {
-        isPaused = false;
-        break;
-      }
-      
-      // Check for skip while paused
-      skipDirection = checkJoystick();
-      if (skipDirection != 0) {
-        isPaused = false;
-        return; // Exit function to skip song
-      }
-      
-      // Update visualizer with rest (no note) while paused
-      updateVisualizer(REST);
-      delay(20); // Small delay to prevent tight loop
-    }
-
-    // Play note
-    if (currentNote != 0) {
-      tone(BUZZER_PIN, currentNote, duration * 0.9);
-    }
-
-    // Update visualizer during note
+	// Update visualizer during note
     unsigned long noteStart = millis();
-    while (millis() - noteStart < duration) {
-      // Check joystick during note playback
-      skipDirection = checkJoystick();
-      if (skipDirection != 0) {
-        noTone(BUZZER_PIN);
-        isPaused = false; // Reset pause state when skipping
-        return; // Exit function to skip song
-      }
-      
-      // Check pause button during note playback
-      if (checkPauseButton()) {
-        isPaused = !isPaused;
-        noTone(BUZZER_PIN);
-        // If paused, wait until unpaused
-        while (isPaused) {
-          // Check for unpause
-          if (checkPauseButton()) {
-            isPaused = false;
-            break;
-          }
-          
-          // Check for skip while paused
-          skipDirection = checkJoystick();
-          if (skipDirection != 0) {
-            isPaused = false;
-            return; // Exit function to skip song
-          }
-          
-          // Update visualizer with rest (no note) while paused
-          updateVisualizer(REST);
-          delay(20);
-        }
-        // When unpaused, break out of note loop to move to next note
-        break;
-      }
-      
-      updateVisualizer(currentNote);
-      delay(20); // Refresh rate
-    }
+    while (millis() - noteStart < note.durationMs) {
+      if ((skip = handlePauseOrSkipReq()) != 0)
+        return skip;
 
-    noTone(BUZZER_PIN);
+      if ((speedChange = checkJoystickY()) != 0) {
+        speedSettingIdx = constrain(speedSettingIdx + speedChange, 0, SPEED_SETTINGS_MAX_IDX);
+        uiState.currentSpeedSettingIdx = speedSettingIdx;
+      }
+
+      updateVisualizer(note.frequency);
+      drawUI();
+      delay(20);
+    }
   }
-  
-  // Song completed normally, reset skip direction and pause state
-  skipDirection = 0;
-  isPaused = false;
+
+  return 1;
+}
+
+int mod(int a, int b) {
+  return (a % b + b) % b;
 }
 
 void setup() {
+  Serial.begin(9600);
   Wire.begin();
-
-  // Initialize OLED
-  u8g2.begin();
 
   // Scan for LCD 1602 I2C address
   uint8_t lcdAddress = scanI2CForLCD();
@@ -364,61 +428,34 @@ void setup() {
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(JOYSTICK_X_PIN, INPUT);
+  pinMode(JOYSTICK_Y_PIN, INPUT);
   pinMode(PAUSE_BUTTON_PIN, INPUT_PULLUP);
   
   // Initialize button state
   lastButtonState = digitalRead(PAUSE_BUTTON_PIN);
 
-  // Display startup message on OLED
+  // Init OLED and show startup message
+  u8g2.begin();
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
   u8g2.drawStr(20, 32, "Music Player");
+  u8g2.setCursor(20, 30);
   u8g2.sendBuffer();
-  delay(1500);
+  delay(800);
 
-  // Update LCD with first song
-  if (lcd) {
-    updateSongDisplay(0);
+  int longest = 0;
+  for (int i = 0; i < song_count; i++)
+    if (songs[i]->length > longest)
+      longest = songs[i]->length;
+
+  uiState.songNoteTimes = (float*)malloc(longest * sizeof(float));
+
+  int currentSong = 0;
+  for (;;) {
+    int skipDirection = playSong(currentSong);
+    currentSong = mod(currentSong + skipDirection, song_count);
+    delay(200);
   }
 }
 
-void loop() {
-  // Check pause button before playing song (in case we need to pause immediately)
-  if (checkPauseButton()) {
-    isPaused = !isPaused;
-  }
-  
-  playSong(currentSong);
-
-  // Handle navigation based on skip direction or normal progression
-  if (skipDirection == 1) {
-    // Skip to next song
-    currentSong++;
-    if (currentSong >= song_count) {
-      currentSong = 0;
-    }
-    // Reset joystick state
-    lastJoystickDirection = 0;
-    joystickHeld = false;
-    skipDirection = 0;
-    delay(200); // Debounce delay
-  } else if (skipDirection == -1) {
-    // Go to previous song
-    currentSong--;
-    if (currentSong < 0) {
-      currentSong = song_count - 1;
-    }
-    // Reset joystick state
-    lastJoystickDirection = 0;
-    joystickHeld = false;
-    skipDirection = 0;
-    delay(200); // Debounce delay
-  } else {
-    // No joystick input, advance normally
-    currentSong++;
-    if (currentSong >= song_count) {
-      currentSong = 0;
-    }
-    delay(1000);
-  }
-}
+void loop() {}
